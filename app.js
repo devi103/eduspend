@@ -144,23 +144,11 @@
     "Use campus fitness centers and free recreational activities instead of expensive gym memberships."
   ];
 
-  // Supabase Client Initialization
-  const SUPABASE_URL = (window.ENV && window.ENV.SUPABASE_URL) || 'https://rzsceanhmmrkevyzbqba.supabase.co';
-  const SUPABASE_ANON_KEY = (window.ENV && window.ENV.SUPABASE_ANON_KEY) || 'sb_publishable_Io3nYD8s_3rLReuCT6wv2Q_NYXy9dB6';
+  // Use the shared Supabase client initialized by js/supabase-config.js
+  let supabase = window.eduspendSupabase || null;
 
-  let supabase = null;
-  if (window.supabase && typeof window.supabase.createClient === 'function') {
-    try {
-      supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
-        auth: {
-          persistSession: true,
-          autoRefreshToken: true,
-          detectSessionInUrl: true
-        }
-      });
-    } catch (err) {
-      console.warn('Supabase initialization notice:', err);
-    }
+  if (!supabase) {
+    console.warn('[EduSpend] Shared Supabase client is unavailable.');
   }
 
   // Application State
@@ -178,96 +166,109 @@
     useExpensesTable: true,
   };
 
+  let cloudLoadVersion = 0;
+
   // Chart instances
   let categoryChartInstance = null;
   let dailyChartInstance = null;
 
   // Initialize App
   async function init() {
-    loadLocalState();
+    // Do not load guest data until the authentication session is checked.
     setupTheme();
     setupNavigation();
     setupEventListeners();
-    setupCategoryBudgetDefaults();
     setupAuthListeners();
 
-    // Set default date in Add Expense form to today
     const dateInput = document.getElementById('expenseDate');
     if (dateInput) {
       dateInput.value = todayStr;
       dateInput.max = todayStr;
     }
 
-    // Pick random student tip
     const tipEl = document.getElementById('dailyTipText');
     if (tipEl) {
       const randomTip = STUDENT_TIPS[Math.floor(Math.random() * STUDENT_TIPS.length)];
       tipEl.innerHTML = randomTip;
     }
 
-    // Refresh UI & Charts
-    renderAll();
-
-    // Check Supabase Auth Session
     await checkInitialSession();
 
-    // Refresh icons
     if (window.lucide) {
       window.lucide.createIcons();
     }
   }
-
   // ==========================================
   // SUPABASE AUTHENTICATION & SESSION
   // ==========================================
 
   async function checkInitialSession() {
     if (!supabase) {
+      state.user = null;
+      loadLocalState(null);
+      setupCategoryBudgetDefaults();
       updateAuthUI(null);
+      renderAll();
       return;
     }
 
     try {
       const { data: { session }, error } = await supabase.auth.getSession();
+
       if (error) {
         console.warn('Session check warning:', error.message);
+        state.user = null;
+        state.expenses = [];
         updateAuthUI(null);
+        renderAll();
         return;
       }
 
       if (session && session.user) {
         state.user = session.user;
+        loadLocalState(session.user.id);
+        setupCategoryBudgetDefaults();
         updateAuthUI(session.user);
         await loadCloudData();
       } else {
+        state.user = null;
+        loadLocalState(null);
+        setupCategoryBudgetDefaults();
         updateAuthUI(null);
+        renderAll();
       }
     } catch (e) {
       console.warn('Auth check catch:', e);
+      state.user = null;
+      state.expenses = [];
       updateAuthUI(null);
+      renderAll();
+      return;
     }
 
-    // Listen to Auth State Changes
-    supabase.auth.onAuthStateChange(async (event, session) => {
+    // Listen for account changes after the initial session has been resolved.
+    supabase.auth.onAuthStateChange((event, session) => {
       if (session && session.user) {
-        state.user = session.user;
-        updateAuthUI(session.user);
-        if (event === 'SIGNED_IN') {
-          showToast(`Welcome back, ${getUserDisplayName(session.user)}!`, 'success');
-          await loadCloudData();
+        const nextUserId = session.user.id;
+
+        if (state.user?.id !== nextUserId) {
+          state.user = session.user;
+          loadLocalState(nextUserId);
+          setupCategoryBudgetDefaults();
+          updateAuthUI(session.user);
+          void loadCloudData();
         }
-      } else {
+      } else if (event === 'SIGNED_OUT') {
         state.user = null;
+        cloudLoadVersion++;
+        loadLocalState(null);
+        setupCategoryBudgetDefaults();
         updateAuthUI(null);
-        if (event === 'SIGNED_OUT') {
-          loadLocalState();
-          renderAll();
-          showToast('Signed out. Local guest mode active.', 'info');
-        }
+        renderAll();
+        showToast('Signed out. Guest data remains stored locally.', 'info');
       }
     });
   }
-
   function getUserDisplayName(user) {
     if (!user) return 'Guest Student';
     if (user.user_metadata && user.user_metadata.full_name) {
@@ -367,77 +368,94 @@
   async function loadCloudData() {
     if (!supabase || !state.user) return;
 
+    const userId = state.user.id;
+    const loadVersion = ++cloudLoadVersion;
+
     try {
-      // 1. Fetch Profile info (currency, allowance, category budgets)
       const { data: profile, error: profileErr } = await supabase
         .from('profiles')
         .select('*')
-        .eq('id', state.user.id)
+        .eq('id', userId)
         .maybeSingle();
 
-      if (!profileErr && profile) {
+      if (state.user?.id !== userId || loadVersion !== cloudLoadVersion) return;
+      if (profileErr) throw profileErr;
+
+      if (profile) {
         if (profile.currency) state.currency = profile.currency;
-        if (profile.monthly_allowance) state.monthlyAllowance = parseFloat(profile.monthly_allowance);
-        if (profile.category_budgets) {
-          state.categoryBudgets = { ...state.categoryBudgets, ...profile.category_budgets };
+
+        if (profile.monthly_allowance !== null && profile.monthly_allowance !== undefined) {
+          state.monthlyAllowance = parseFloat(profile.monthly_allowance);
         }
-      } else if (!profile) {
-        // Create initial profile record if trigger didn't run
-        await supabase.from('profiles').insert([{
-          id: state.user.id,
-          email: state.user.email,
-          full_name: getUserDisplayName(state.user),
-          currency: state.currency,
-          monthly_allowance: state.monthlyAllowance,
-          category_budgets: state.categoryBudgets
-        }]);
+
+        if (profile.category_budgets) {
+          state.categoryBudgets = {
+            ...state.categoryBudgets,
+            ...profile.category_budgets
+          };
+        }
+      } else {
+        const { error: insertProfileErr } = await supabase
+          .from('profiles')
+          .insert([{
+            id: userId,
+            email: state.user.email,
+            full_name: getUserDisplayName(state.user),
+            currency: state.currency,
+            monthly_allowance: state.monthlyAllowance,
+            category_budgets: state.categoryBudgets
+          }]);
+
+        if (insertProfileErr) {
+          console.warn('Profile creation notice:', insertProfileErr.message);
+        }
       }
 
-      // 2. Fetch Expenses from 'expenses' table
       const { data: expensesData, error: expErr } = await supabase
         .from('expenses')
         .select('*')
-        .eq('user_id', state.user.id)
+        .eq('user_id', userId)
         .order('date', { ascending: false })
         .order('created_at', { ascending: false });
 
-      if (!expErr && expensesData) {
-        state.useExpensesTable = true;
-        if (expensesData.length > 0) {
-          state.expenses = expensesData.map(e => ({
-            id: e.id,
-            title: e.title,
-            amount: parseFloat(e.amount),
-            category: e.category,
-            date: e.date,
-            paymentMethod: e.payment_method || 'UPI / Online',
-            notes: e.notes || ''
-          }));
-        } else {
-          // New cloud user: offer to migrate current local sample/expenses or keep clean
-          if (state.expenses.length > 0) {
-            console.log('User has local expenses, ready for sync');
-          }
-        }
-      } else if (expErr) {
+      // A different account may have signed in while the request was running.
+      if (state.user?.id !== userId || loadVersion !== cloudLoadVersion) return;
+
+      if (expErr) {
         console.warn('Expenses table fetch note:', expErr.message);
-        // If table doesn't exist yet, we keep local state and flag
         state.useExpensesTable = false;
+        // Keep only this account's namespaced local cache on fetch failure.
+      } else {
+        state.useExpensesTable = true;
+
+        // An empty cloud result must clear this account's previous cached expenses.
+        state.expenses = (expensesData || []).map(e => ({
+          id: e.id,
+          title: e.title,
+          amount: parseFloat(e.amount),
+          category: e.category,
+          date: e.date,
+          paymentMethod: e.payment_method || 'UPI / Online',
+          notes: e.notes || ''
+        }));
       }
 
       saveLocalState();
       renderAll();
     } catch (e) {
-      console.warn('Error loading cloud data, keeping local cache:', e);
+      if (state.user?.id !== userId || loadVersion !== cloudLoadVersion) return;
+      console.warn('Error loading cloud data; retaining this account cache:', e);
+      renderAll();
     }
   }
-
   async function cloudInsertExpense(expense) {
     if (!supabase || !state.user || !state.useExpensesTable) return false;
 
+    const userId = state.user.id;
+
     try {
       const payload = {
-        user_id: state.user.id,
+        user_id: userId,
         title: expense.title,
         amount: expense.amount,
         category: expense.category,
@@ -457,8 +475,10 @@
         return false;
       }
 
+      if (state.user?.id !== userId) return false;
+
       if (data && data.id) {
-        expense.id = data.id; // Map returned UUID
+        expense.id = data.id;
       }
       return true;
     } catch (e) {
@@ -466,12 +486,12 @@
       return false;
     }
   }
-
   async function cloudDeleteExpense(id) {
     if (!supabase || !state.user || !state.useExpensesTable) return false;
 
+    const userId = state.user.id;
+
     try {
-      // Check if id is a UUID
       const isUUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id);
       if (!isUUID) return false;
 
@@ -479,110 +499,105 @@
         .from('expenses')
         .delete()
         .eq('id', id)
-        .eq('user_id', state.user.id);
+        .eq('user_id', userId);
 
       if (error) {
         console.warn('Cloud delete error:', error.message);
         return false;
       }
-      return true;
+
+      return state.user?.id === userId;
     } catch (e) {
       console.warn('Cloud delete catch:', e);
       return false;
     }
   }
-
   async function cloudUpdateProfile(fields) {
     if (!supabase || !state.user) return;
 
+    const userId = state.user.id;
+
     try {
-      await supabase
+      const { error } = await supabase
         .from('profiles')
         .update({
           ...fields,
           updated_at: new Date().toISOString()
         })
-        .eq('id', state.user.id);
+        .eq('id', userId);
+
+      if (error) {
+        console.warn('Cloud profile update notice:', error.message);
+      }
     } catch (e) {
       console.warn('Cloud profile update notice:', e);
     }
   }
-
   async function migrateLocalExpensesToCloud() {
-    if (!supabase || !state.user) {
-      showToast('Please sign in first to sync to Supabase!', 'error');
-      openAuthModal('signin');
-      return;
-    }
-
-    if (state.expenses.length === 0) {
-      showToast('No local expenses to sync.', 'info');
-      return;
-    }
-
-    try {
-      showToast('Syncing local expenses to cloud...', 'info');
-
-      const payloads = state.expenses.map(e => ({
-        user_id: state.user.id,
-        title: e.title,
-        amount: e.amount,
-        category: e.category,
-        date: e.date,
-        payment_method: e.paymentMethod || 'UPI / Online',
-        notes: e.notes || ''
-      }));
-
-      const { error } = await supabase.from('expenses').insert(payloads);
-
-      if (error) {
-        showToast(`Sync error: ${error.message}`, 'error');
-        return;
-      }
-
-      showToast(`Synced ${payloads.length} expenses to Supabase cloud!`, 'success');
-      await loadCloudData();
-    } catch (e) {
-      showToast('Failed to sync: ' + e.message, 'error');
-    }
+    showToast(
+      'Automatic guest-to-account migration is disabled to protect account privacy. Add expenses while signed in to save them to your account.',
+      'info'
+    );
   }
-
   // ==========================================
   // LOCAL STATE MANAGEMENT (OFFLINE RESILIENCE)
   // ==========================================
 
-  function loadLocalState() {
+  function getLocalStorageKeys(userId = null) {
+    if (!userId) return STORAGE_KEYS;
+
+    const prefix = `eduspend_user_${userId}_`;
+
+    return {
+      EXPENSES: `${prefix}expenses`,
+      ALLOWANCE: `${prefix}allowance`,
+      CURRENCY: `${prefix}currency`,
+      CATEGORY_BUDGETS: `${prefix}category_budgets`
+    };
+  }
+
+  function loadLocalState(userId = null) {
+    const keys = getLocalStorageKeys(userId);
+    const defaultExpenses = userId ? [] : [...DEFAULT_EXPENSES];
+
     try {
-      const storedExpenses = localStorage.getItem(STORAGE_KEYS.EXPENSES);
-      state.expenses = storedExpenses ? JSON.parse(storedExpenses) : [...DEFAULT_EXPENSES];
+      const storedExpenses = localStorage.getItem(keys.EXPENSES);
+      const parsedExpenses = storedExpenses ? JSON.parse(storedExpenses) : defaultExpenses;
+      state.expenses = Array.isArray(parsedExpenses) ? parsedExpenses : defaultExpenses;
 
-      const storedAllowance = localStorage.getItem(STORAGE_KEYS.ALLOWANCE);
-      state.monthlyAllowance = storedAllowance ? parseFloat(storedAllowance) : 500;
+      const storedAllowance = localStorage.getItem(keys.ALLOWANCE);
+      const parsedAllowance = storedAllowance ? parseFloat(storedAllowance) : 500;
+      state.monthlyAllowance = Number.isFinite(parsedAllowance) ? parsedAllowance : 500;
 
-      const storedCurrency = localStorage.getItem(STORAGE_KEYS.CURRENCY);
+      const storedCurrency = localStorage.getItem(keys.CURRENCY);
       state.currency = storedCurrency || '$';
 
-      const storedBudgets = localStorage.getItem(STORAGE_KEYS.CATEGORY_BUDGETS);
-      state.categoryBudgets = storedBudgets ? JSON.parse(storedBudgets) : {};
+      const storedBudgets = localStorage.getItem(keys.CATEGORY_BUDGETS);
+      const parsedBudgets = storedBudgets ? JSON.parse(storedBudgets) : {};
+      state.categoryBudgets = parsedBudgets && typeof parsedBudgets === 'object'
+        ? parsedBudgets
+        : {};
     } catch (e) {
       console.warn('LocalStorage notice:', e);
-      state.expenses = [...DEFAULT_EXPENSES];
+      state.expenses = defaultExpenses;
       state.monthlyAllowance = 500;
       state.currency = '$';
+      state.categoryBudgets = {};
     }
   }
 
   function saveLocalState() {
+    const keys = getLocalStorageKeys(state.user?.id || null);
+
     try {
-      localStorage.setItem(STORAGE_KEYS.EXPENSES, JSON.stringify(state.expenses));
-      localStorage.setItem(STORAGE_KEYS.ALLOWANCE, state.monthlyAllowance.toString());
-      localStorage.setItem(STORAGE_KEYS.CURRENCY, state.currency);
-      localStorage.setItem(STORAGE_KEYS.CATEGORY_BUDGETS, JSON.stringify(state.categoryBudgets));
+      localStorage.setItem(keys.EXPENSES, JSON.stringify(state.expenses));
+      localStorage.setItem(keys.ALLOWANCE, state.monthlyAllowance.toString());
+      localStorage.setItem(keys.CURRENCY, state.currency);
+      localStorage.setItem(keys.CATEGORY_BUDGETS, JSON.stringify(state.categoryBudgets));
     } catch (e) {
       console.warn('Failed to save state to localStorage:', e);
     }
   }
-
   function setupCategoryBudgetDefaults() {
     for (const [cat, info] of Object.entries(CATEGORIES)) {
       if (!state.categoryBudgets[cat]) {
