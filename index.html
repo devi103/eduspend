@@ -15,6 +15,8 @@
   <script src="https://unpkg.com/lucide@latest"></script>
   <!-- Canvas Confetti -->
   <script src="https://cdn.jsdelivr.net/npm/canvas-confetti@1.6.0/dist/confetti.browser.min.js"></script>
+  <!-- Supabase JS CDN -->
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
   
   <script>
     tailwind.config = {
@@ -459,7 +461,7 @@
               <span id="formCurrencyPrefix" class="absolute inset-y-0 left-0 pl-4 flex items-center pointer-events-none text-2xl font-bold text-slate-400">
                 $
               </span>
-              <input type="number" step="0.01" min="0.01" id="expenseAmount" required placeholder="0.00" class="block w-full pl-10 pr-4 py-3.5 text-2xl font-extrabold bg-slate-50 dark:bg-slate-800 text-slate-900 dark:text-white rounded-2xl border border-slate-200 dark:border-slate-700 focus:ring-2 focus:ring-brand-500 focus:border-brand-500 outline-none transition-all">
+              <input type="number" step="0.01" min="0.01" id="expenseAmount" required placeholder="0.00" class="block w-full pl-20 pr-4 py-3.5 text-2xl font-extrabold bg-slate-50 dark:bg-slate-800 text-slate-900 dark:text-white rounded-2xl border border-slate-200 dark:border-slate-700 focus:ring-2 focus:ring-brand-500 focus:border-brand-500 outline-none transition-all">
             </div>
           </div>
 
@@ -748,6 +750,10 @@
   <!-- Toast Notification Container -->
   <div id="toastContainer" class="fixed bottom-5 right-5 z-50 flex flex-col gap-2 pointer-events-none"></div>
 
+  <!-- Supabase & Auth Modules -->
+  <script src="js/supabase-config.js"></script>
+  <script src="js/auth.js"></script>
+  <script src="js/backend.js"></script>
   <!-- Main JavaScript Logic -->
   <script src="app.js"></script>
 </body>

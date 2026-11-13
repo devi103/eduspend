@@ -1,18 +1,19 @@
 /**
- * EduSpend — Student Budget & Expense Dashboard
- * Frontend Architecture & State Management
+ * EduSpend — Smart Student Expense & Budget Dashboard
+ * Full-Stack Client Architecture with Supabase Integration
  */
 
 (function () {
   'use strict';
 
-  // Constants & Storage Keys
+  // Constants & Local Storage Keys
   const STORAGE_KEYS = {
     EXPENSES: 'eduspend_expenses',
     ALLOWANCE: 'eduspend_allowance',
     CURRENCY: 'eduspend_currency',
     THEME: 'eduspend_theme',
     CATEGORY_BUDGETS: 'eduspend_category_budgets',
+    GUEST_SESSION: 'eduspend_guest_mode',
   };
 
   // Category Configuration
@@ -39,7 +40,7 @@
   const now = new Date();
   const todayStr = formatDateISO(now);
   const currentYear = now.getFullYear();
-  const currentMonth = now.getMonth(); // 0-indexed
+  const currentMonth = now.getMonth();
 
   // Sample initial transactions for a realistic student experience
   const DEFAULT_EXPENSES = [
@@ -143,33 +144,58 @@
     "Use campus fitness centers and free recreational activities instead of expensive gym memberships."
   ];
 
-  // State
+  // Supabase Client Initialization
+  const SUPABASE_URL = (window.ENV && window.ENV.SUPABASE_URL) || 'https://rzsceanhmmrkevyzbqba.supabase.co';
+  const SUPABASE_ANON_KEY = (window.ENV && window.ENV.SUPABASE_ANON_KEY) || 'sb_publishable_Io3nYD8s_3rLReuCT6wv2Q_NYXy9dB6';
+
+  let supabase = null;
+  if (window.supabase && typeof window.supabase.createClient === 'function') {
+    try {
+      supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
+        auth: {
+          persistSession: true,
+          autoRefreshToken: true,
+          detectSessionInUrl: true
+        }
+      });
+    } catch (err) {
+      console.warn('Supabase initialization notice:', err);
+    }
+  }
+
+  // Application State
   const state = {
     expenses: [],
     monthlyAllowance: 500,
     currency: '$',
     categoryBudgets: {},
-    chartRange: 'month', // '7days' or 'month'
+    chartRange: 'month',
     currentSection: 'dashboard',
+    user: null,
+    authTab: 'signin', // 'signin' | 'signup' | 'reset'
+    isCloudSynced: false,
+    hasCheckedExpensesTable: false,
+    useExpensesTable: true,
   };
 
-  // Chart references
+  // Chart instances
   let categoryChartInstance = null;
   let dailyChartInstance = null;
 
   // Initialize App
-  function init() {
-    loadState();
+  async function init() {
+    loadLocalState();
     setupTheme();
     setupNavigation();
     setupEventListeners();
     setupCategoryBudgetDefaults();
-    
+    setupAuthListeners();
+
     // Set default date in Add Expense form to today
     const dateInput = document.getElementById('expenseDate');
     if (dateInput) {
       dateInput.value = todayStr;
-      dateInput.max = todayStr; // can't add future expenses
+      dateInput.max = todayStr;
     }
 
     // Pick random student tip
@@ -182,14 +208,350 @@
     // Refresh UI & Charts
     renderAll();
 
-    // Re-initialize Lucide icons
+    // Check Supabase Auth Session
+    await checkInitialSession();
+
+    // Refresh icons
     if (window.lucide) {
       window.lucide.createIcons();
     }
   }
 
-  // Load state from localStorage or seed
-  function loadState() {
+  // ==========================================
+  // SUPABASE AUTHENTICATION & SESSION
+  // ==========================================
+
+  async function checkInitialSession() {
+    if (!supabase) {
+      updateAuthUI(null);
+      return;
+    }
+
+    try {
+      const { data: { session }, error } = await supabase.auth.getSession();
+      if (error) {
+        console.warn('Session check warning:', error.message);
+        updateAuthUI(null);
+        return;
+      }
+
+      if (session && session.user) {
+        state.user = session.user;
+        updateAuthUI(session.user);
+        await loadCloudData();
+      } else {
+        updateAuthUI(null);
+      }
+    } catch (e) {
+      console.warn('Auth check catch:', e);
+      updateAuthUI(null);
+    }
+
+    // Listen to Auth State Changes
+    supabase.auth.onAuthStateChange(async (event, session) => {
+      if (session && session.user) {
+        state.user = session.user;
+        updateAuthUI(session.user);
+        if (event === 'SIGNED_IN') {
+          showToast(`Welcome back, ${getUserDisplayName(session.user)}!`, 'success');
+          await loadCloudData();
+        }
+      } else {
+        state.user = null;
+        updateAuthUI(null);
+        if (event === 'SIGNED_OUT') {
+          loadLocalState();
+          renderAll();
+          showToast('Signed out. Local guest mode active.', 'info');
+        }
+      }
+    });
+  }
+
+  function getUserDisplayName(user) {
+    if (!user) return 'Guest Student';
+    if (user.user_metadata && user.user_metadata.full_name) {
+      return user.user_metadata.full_name;
+    }
+    if (user.email) {
+      const namePart = user.email.split('@')[0];
+      return namePart.charAt(0).toUpperCase() + namePart.slice(1);
+    }
+    return 'Student User';
+  }
+
+  function getUserInitials(name) {
+    if (!name) return 'GS';
+    const parts = name.trim().split(/\s+/);
+    if (parts.length === 1) return parts[0].slice(0, 2).toUpperCase();
+    return (parts[0][0] + parts[parts.length - 1][0]).toUpperCase();
+  }
+
+  function updateAuthUI(user) {
+    const userNameDisplay = document.getElementById('userNameDisplay');
+    const userEmailDisplay = document.getElementById('userEmailDisplay');
+    const userAvatarInitials = document.getElementById('userAvatarInitials');
+    const sidebarAuthText = document.getElementById('sidebarAuthText');
+    const sidebarAuthIcon = document.getElementById('sidebarAuthIcon');
+    const authTriggerText = document.getElementById('authTriggerText');
+    const cloudStatusDot = document.getElementById('cloudStatusDot');
+    const cloudStatusText = document.getElementById('cloudStatusText');
+    const mobileCloudText = document.getElementById('mobileCloudText');
+    const storageModeDot = document.getElementById('storageModeDot');
+    const storageModeText = document.getElementById('storageModeText');
+    const modalStorageState = document.getElementById('modalStorageState');
+    const modalStorageDetails = document.getElementById('modalStorageDetails');
+
+    if (user) {
+      state.isCloudSynced = true;
+      const displayName = getUserDisplayName(user);
+      const initials = getUserInitials(displayName);
+
+      if (userNameDisplay) userNameDisplay.textContent = displayName;
+      if (userEmailDisplay) userEmailDisplay.textContent = user.email || 'Cloud Account';
+      if (userAvatarInitials) userAvatarInitials.textContent = initials;
+
+      if (sidebarAuthText) sidebarAuthText.textContent = 'Sign Out';
+      if (authTriggerText) authTriggerText.textContent = 'Sign Out';
+
+      if (cloudStatusDot) {
+        cloudStatusDot.className = 'w-2 h-2 rounded-full bg-emerald-500 pulse-emerald';
+      }
+      if (cloudStatusText) cloudStatusText.textContent = 'Cloud Connected';
+      if (mobileCloudText) mobileCloudText.textContent = 'Synced';
+
+      if (storageModeDot) storageModeDot.className = 'w-1.5 h-1.5 rounded-full bg-emerald-500';
+      if (storageModeText) storageModeText.textContent = 'Supabase Cloud';
+
+      if (modalStorageState) {
+        modalStorageState.textContent = 'Supabase Cloud (Active)';
+        modalStorageState.className = 'font-bold text-emerald-600 dark:text-emerald-400';
+      }
+      if (modalStorageDetails) {
+        modalStorageDetails.textContent = `Signed in as ${user.email}. All records secured with PostgreSQL Row Level Security (RLS).`;
+      }
+    } else {
+      state.isCloudSynced = false;
+      if (userNameDisplay) userNameDisplay.textContent = 'Guest Student';
+      if (userEmailDisplay) userEmailDisplay.textContent = 'Local Mode';
+      if (userAvatarInitials) userAvatarInitials.textContent = 'GS';
+
+      if (sidebarAuthText) sidebarAuthText.textContent = 'Sign In';
+      if (authTriggerText) authTriggerText.textContent = 'Sign In';
+
+      if (cloudStatusDot) {
+        cloudStatusDot.className = 'w-2 h-2 rounded-full bg-amber-500';
+      }
+      if (cloudStatusText) cloudStatusText.textContent = 'Guest Mode';
+      if (mobileCloudText) mobileCloudText.textContent = 'Local';
+
+      if (storageModeDot) storageModeDot.className = 'w-1.5 h-1.5 rounded-full bg-amber-500';
+      if (storageModeText) storageModeText.textContent = 'Local Storage';
+
+      if (modalStorageState) {
+        modalStorageState.textContent = 'Local Storage (Guest)';
+        modalStorageState.className = 'font-bold text-amber-600 dark:text-amber-400';
+      }
+      if (modalStorageDetails) {
+        modalStorageDetails.textContent = 'Running in offline guest mode. Sign in to automatically sync your budget with PostgreSQL.';
+      }
+    }
+
+    if (window.lucide) window.lucide.createIcons();
+  }
+
+  // ==========================================
+  // SUPABASE CLOUD DATA OPERATIONS
+  // ==========================================
+
+  async function loadCloudData() {
+    if (!supabase || !state.user) return;
+
+    try {
+      // 1. Fetch Profile info (currency, allowance, category budgets)
+      const { data: profile, error: profileErr } = await supabase
+        .from('profiles')
+        .select('*')
+        .eq('id', state.user.id)
+        .maybeSingle();
+
+      if (!profileErr && profile) {
+        if (profile.currency) state.currency = profile.currency;
+        if (profile.monthly_allowance) state.monthlyAllowance = parseFloat(profile.monthly_allowance);
+        if (profile.category_budgets) {
+          state.categoryBudgets = { ...state.categoryBudgets, ...profile.category_budgets };
+        }
+      } else if (!profile) {
+        // Create initial profile record if trigger didn't run
+        await supabase.from('profiles').insert([{
+          id: state.user.id,
+          email: state.user.email,
+          full_name: getUserDisplayName(state.user),
+          currency: state.currency,
+          monthly_allowance: state.monthlyAllowance,
+          category_budgets: state.categoryBudgets
+        }]);
+      }
+
+      // 2. Fetch Expenses from 'expenses' table
+      const { data: expensesData, error: expErr } = await supabase
+        .from('expenses')
+        .select('*')
+        .eq('user_id', state.user.id)
+        .order('date', { ascending: false })
+        .order('created_at', { ascending: false });
+
+      if (!expErr && expensesData) {
+        state.useExpensesTable = true;
+        if (expensesData.length > 0) {
+          state.expenses = expensesData.map(e => ({
+            id: e.id,
+            title: e.title,
+            amount: parseFloat(e.amount),
+            category: e.category,
+            date: e.date,
+            paymentMethod: e.payment_method || 'UPI / Online',
+            notes: e.notes || ''
+          }));
+        } else {
+          // New cloud user: offer to migrate current local sample/expenses or keep clean
+          if (state.expenses.length > 0) {
+            console.log('User has local expenses, ready for sync');
+          }
+        }
+      } else if (expErr) {
+        console.warn('Expenses table fetch note:', expErr.message);
+        // If table doesn't exist yet, we keep local state and flag
+        state.useExpensesTable = false;
+      }
+
+      saveLocalState();
+      renderAll();
+    } catch (e) {
+      console.warn('Error loading cloud data, keeping local cache:', e);
+    }
+  }
+
+  async function cloudInsertExpense(expense) {
+    if (!supabase || !state.user || !state.useExpensesTable) return false;
+
+    try {
+      const payload = {
+        user_id: state.user.id,
+        title: expense.title,
+        amount: expense.amount,
+        category: expense.category,
+        date: expense.date,
+        payment_method: expense.paymentMethod,
+        notes: expense.notes || ''
+      };
+
+      const { data, error } = await supabase
+        .from('expenses')
+        .insert([payload])
+        .select()
+        .single();
+
+      if (error) {
+        console.warn('Cloud insert error:', error.message);
+        return false;
+      }
+
+      if (data && data.id) {
+        expense.id = data.id; // Map returned UUID
+      }
+      return true;
+    } catch (e) {
+      console.warn('Cloud insert catch:', e);
+      return false;
+    }
+  }
+
+  async function cloudDeleteExpense(id) {
+    if (!supabase || !state.user || !state.useExpensesTable) return false;
+
+    try {
+      // Check if id is a UUID
+      const isUUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id);
+      if (!isUUID) return false;
+
+      const { error } = await supabase
+        .from('expenses')
+        .delete()
+        .eq('id', id)
+        .eq('user_id', state.user.id);
+
+      if (error) {
+        console.warn('Cloud delete error:', error.message);
+        return false;
+      }
+      return true;
+    } catch (e) {
+      console.warn('Cloud delete catch:', e);
+      return false;
+    }
+  }
+
+  async function cloudUpdateProfile(fields) {
+    if (!supabase || !state.user) return;
+
+    try {
+      await supabase
+        .from('profiles')
+        .update({
+          ...fields,
+          updated_at: new Date().toISOString()
+        })
+        .eq('id', state.user.id);
+    } catch (e) {
+      console.warn('Cloud profile update notice:', e);
+    }
+  }
+
+  async function migrateLocalExpensesToCloud() {
+    if (!supabase || !state.user) {
+      showToast('Please sign in first to sync to Supabase!', 'error');
+      openAuthModal('signin');
+      return;
+    }
+
+    if (state.expenses.length === 0) {
+      showToast('No local expenses to sync.', 'info');
+      return;
+    }
+
+    try {
+      showToast('Syncing local expenses to cloud...', 'info');
+
+      const payloads = state.expenses.map(e => ({
+        user_id: state.user.id,
+        title: e.title,
+        amount: e.amount,
+        category: e.category,
+        date: e.date,
+        payment_method: e.paymentMethod || 'UPI / Online',
+        notes: e.notes || ''
+      }));
+
+      const { error } = await supabase.from('expenses').insert(payloads);
+
+      if (error) {
+        showToast(`Sync error: ${error.message}`, 'error');
+        return;
+      }
+
+      showToast(`Synced ${payloads.length} expenses to Supabase cloud!`, 'success');
+      await loadCloudData();
+    } catch (e) {
+      showToast('Failed to sync: ' + e.message, 'error');
+    }
+  }
+
+  // ==========================================
+  // LOCAL STATE MANAGEMENT (OFFLINE RESILIENCE)
+  // ==========================================
+
+  function loadLocalState() {
     try {
       const storedExpenses = localStorage.getItem(STORAGE_KEYS.EXPENSES);
       state.expenses = storedExpenses ? JSON.parse(storedExpenses) : [...DEFAULT_EXPENSES];
@@ -203,21 +565,21 @@
       const storedBudgets = localStorage.getItem(STORAGE_KEYS.CATEGORY_BUDGETS);
       state.categoryBudgets = storedBudgets ? JSON.parse(storedBudgets) : {};
     } catch (e) {
-      console.warn('LocalStorage error, using defaults', e);
+      console.warn('LocalStorage notice:', e);
       state.expenses = [...DEFAULT_EXPENSES];
       state.monthlyAllowance = 500;
       state.currency = '$';
     }
   }
 
-  function saveState() {
+  function saveLocalState() {
     try {
       localStorage.setItem(STORAGE_KEYS.EXPENSES, JSON.stringify(state.expenses));
       localStorage.setItem(STORAGE_KEYS.ALLOWANCE, state.monthlyAllowance.toString());
       localStorage.setItem(STORAGE_KEYS.CURRENCY, state.currency);
       localStorage.setItem(STORAGE_KEYS.CATEGORY_BUDGETS, JSON.stringify(state.categoryBudgets));
     } catch (e) {
-      console.warn('Failed to save state to localStorage', e);
+      console.warn('Failed to save state to localStorage:', e);
     }
   }
 
@@ -229,11 +591,14 @@
     }
   }
 
-  // Theme Handling
+  // ==========================================
+  // THEME & NAVIGATION
+  // ==========================================
+
   function setupTheme() {
     const savedTheme = localStorage.getItem(STORAGE_KEYS.THEME);
     const prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
-    
+
     if (savedTheme === 'dark' || (!savedTheme && prefersDark)) {
       document.documentElement.classList.add('dark');
     } else {
@@ -248,7 +613,6 @@
     if (dailyChartInstance) updateDailyChart();
   }
 
-  // Navigation Logic
   function setupNavigation() {
     const navItems = document.querySelectorAll('.nav-item');
     const sections = {
@@ -279,7 +643,6 @@
 
       state.currentSection = targetKey;
 
-      // Update active nav button
       navItems.forEach(btn => {
         if (btn.dataset.section === targetKey) {
           btn.classList.add('active');
@@ -288,7 +651,6 @@
         }
       });
 
-      // Show/hide section containers
       Object.keys(sections).forEach(key => {
         if (key === targetKey) {
           sections[key].el.classList.remove('hidden');
@@ -297,16 +659,13 @@
         }
       });
 
-      // Update main title & subtitle
       const titleEl = document.getElementById('sectionTitle');
       const subtitleEl = document.getElementById('sectionSubtitle');
       if (titleEl) titleEl.textContent = sections[targetKey].title;
       if (subtitleEl) subtitleEl.textContent = sections[targetKey].subtitle;
 
-      // Close mobile sidebar if open
       closeMobileSidebar();
 
-      // Refresh section-specific widgets
       if (targetKey === 'dashboard') {
         setTimeout(() => {
           if (categoryChartInstance) categoryChartInstance.resize();
@@ -322,19 +681,14 @@
     }
 
     navItems.forEach(btn => {
-      btn.addEventListener('click', () => {
-        const sec = btn.dataset.section;
-        switchSection(sec);
-      });
+      btn.addEventListener('click', () => switchSection(btn.dataset.section));
     });
 
-    // Quick add top button
     const quickAddBtn = document.getElementById('quickAddExpenseTopBtn');
     if (quickAddBtn) {
       quickAddBtn.addEventListener('click', () => switchSection('add-expense'));
     }
 
-    // Nav-switch buttons inside views
     document.querySelectorAll('.nav-switch-btn').forEach(btn => {
       btn.addEventListener('click', () => {
         const sec = btn.dataset.section;
@@ -343,7 +697,6 @@
     });
   }
 
-  // Mobile Drawer
   function closeMobileSidebar() {
     const sidebar = document.getElementById('sidebar');
     const overlay = document.getElementById('sidebarOverlay');
@@ -358,15 +711,286 @@
     if (overlay) overlay.classList.remove('hidden');
   }
 
-  // Event Listeners setup
+  // ==========================================
+  // AUTH MODAL & EVENT LISTENERS
+  // ==========================================
+
+  function openAuthModal(tab = 'signin') {
+    const modal = document.getElementById('authModal');
+    if (!modal) return;
+    setAuthTab(tab);
+    modal.classList.remove('hidden');
+  }
+
+  function closeAuthModal() {
+    const modal = document.getElementById('authModal');
+    if (modal) modal.classList.add('hidden');
+    clearAuthAlert();
+  }
+
+  function setAuthTab(tab) {
+    state.authTab = tab;
+    clearAuthAlert();
+
+    const tabSignIn = document.getElementById('authTabSignIn');
+    const tabSignUp = document.getElementById('authTabSignUp');
+    const tabReset = document.getElementById('authTabReset');
+    const fullNameGroup = document.getElementById('authFullNameGroup');
+    const passwordGroup = document.getElementById('authPasswordGroup');
+    const title = document.getElementById('authModalTitle');
+    const subtitle = document.getElementById('authModalSubtitle');
+    const submitBtnText = document.getElementById('authSubmitText');
+    const passwordInput = document.getElementById('authPassword');
+
+    const activeClasses = ['bg-white', 'dark:bg-slate-700', 'text-brand-600', 'dark:text-brand-300', 'shadow-xs'];
+    const inactiveClasses = ['text-slate-600', 'dark:text-slate-400'];
+
+    [tabSignIn, tabSignUp, tabReset].forEach(t => {
+      if (t) {
+        t.classList.remove(...activeClasses);
+        t.classList.add(...inactiveClasses);
+      }
+    });
+
+    if (tab === 'signin') {
+      if (tabSignIn) {
+        tabSignIn.classList.add(...activeClasses);
+        tabSignIn.classList.remove(...inactiveClasses);
+      }
+      if (fullNameGroup) fullNameGroup.classList.add('hidden');
+      if (passwordGroup) passwordGroup.classList.remove('hidden');
+      if (passwordInput) passwordInput.required = true;
+      if (title) title.textContent = 'Sign In to EduSpend';
+      if (subtitle) subtitle.textContent = 'Access your synced expenses and student budget';
+      if (submitBtnText) submitBtnText.textContent = 'Sign In to EduSpend';
+    } else if (tab === 'signup') {
+      if (tabSignUp) {
+        tabSignUp.classList.add(...activeClasses);
+        tabSignUp.classList.remove(...inactiveClasses);
+      }
+      if (fullNameGroup) fullNameGroup.classList.remove('hidden');
+      if (passwordGroup) passwordGroup.classList.remove('hidden');
+      if (passwordInput) passwordInput.required = true;
+      if (title) title.textContent = 'Create Student Account';
+      if (subtitle) subtitle.textContent = 'Start tracking your college budget in the cloud';
+      if (submitBtnText) submitBtnText.textContent = 'Create Student Account';
+    } else if (tab === 'reset') {
+      if (tabReset) {
+        tabReset.classList.add(...activeClasses);
+        tabReset.classList.remove(...inactiveClasses);
+      }
+      if (fullNameGroup) fullNameGroup.classList.add('hidden');
+      if (passwordGroup) passwordGroup.classList.add('hidden');
+      if (passwordInput) passwordInput.required = false;
+      if (title) title.textContent = 'Reset Password';
+      if (subtitle) subtitle.textContent = 'We will email you a secure link to reset your password';
+      if (submitBtnText) submitBtnText.textContent = 'Send Reset Link';
+    }
+  }
+
+  function showAuthAlert(message, type = 'error') {
+    const alertBox = document.getElementById('authAlertBox');
+    if (!alertBox) return;
+
+    alertBox.classList.remove('hidden');
+    if (type === 'error') {
+      alertBox.className = 'mb-4 p-3 rounded-xl text-xs font-semibold bg-rose-50 dark:bg-rose-950/60 text-rose-700 dark:text-rose-300 border border-rose-200 dark:border-rose-800';
+    } else {
+      alertBox.className = 'mb-4 p-3 rounded-xl text-xs font-semibold bg-emerald-50 dark:bg-emerald-950/60 text-emerald-700 dark:text-emerald-300 border border-emerald-200 dark:border-emerald-800';
+    }
+    alertBox.textContent = message;
+  }
+
+  function clearAuthAlert() {
+    const alertBox = document.getElementById('authAlertBox');
+    if (alertBox) alertBox.classList.add('hidden');
+  }
+
+  function setupAuthListeners() {
+    const tabSignIn = document.getElementById('authTabSignIn');
+    const tabSignUp = document.getElementById('authTabSignUp');
+    const tabReset = document.getElementById('authTabReset');
+    const authForm = document.getElementById('authForm');
+    const closeBtn = document.getElementById('closeAuthModalBtn');
+    const guestBtn = document.getElementById('guestModeBtn');
+    const sidebarAuthBtn = document.getElementById('sidebarAuthBtn');
+    const authTriggerBtn = document.getElementById('authTriggerBtn');
+    const cloudStatusBtn = document.getElementById('cloudStatusBtn');
+    const mobileCloudBtn = document.getElementById('mobileCloudBtn');
+    const openCloudInfoBtn = document.getElementById('openCloudInfoBtn');
+    const closeCloudModalBtn = document.getElementById('closeCloudModalBtn');
+    const cloudModal = document.getElementById('cloudStatusModal');
+    const copySqlBtn = document.getElementById('copySqlSchemaBtn');
+    const syncLocalBtn = document.getElementById('syncLocalToCloudBtn');
+
+    if (tabSignIn) tabSignIn.addEventListener('click', () => setAuthTab('signin'));
+    if (tabSignUp) tabSignUp.addEventListener('click', () => setAuthTab('signup'));
+    if (tabReset) tabReset.addEventListener('click', () => setAuthTab('reset'));
+    if (closeBtn) closeBtn.addEventListener('click', closeAuthModal);
+
+    if (guestBtn) {
+      guestBtn.addEventListener('click', () => {
+        closeAuthModal();
+        showToast('Guest mode enabled. Entries stored locally in browser.', 'info');
+      });
+    }
+
+    // Auth Trigger Handlers (toggle between sign in modal and sign out)
+    function handleAuthButtonClick() {
+      if (state.user) {
+        if (confirm(`Sign out of ${state.user.email}?`)) {
+          if (supabase) supabase.auth.signOut();
+        }
+      } else {
+        openAuthModal('signin');
+      }
+    }
+
+    if (sidebarAuthBtn) sidebarAuthBtn.addEventListener('click', handleAuthButtonClick);
+    if (authTriggerBtn) authTriggerBtn.addEventListener('click', handleAuthButtonClick);
+
+    // Cloud Status Modals
+    function openCloudModal() {
+      if (cloudModal) cloudModal.classList.remove('hidden');
+    }
+    function closeCloudModal() {
+      if (cloudModal) cloudModal.classList.add('hidden');
+    }
+
+    if (cloudStatusBtn) cloudStatusBtn.addEventListener('click', openCloudModal);
+    if (mobileCloudBtn) mobileCloudBtn.addEventListener('click', openCloudModal);
+    if (openCloudInfoBtn) openCloudInfoBtn.addEventListener('click', openCloudModal);
+    if (closeCloudModalBtn) closeCloudModalBtn.addEventListener('click', closeCloudModal);
+
+    // Copy SQL Schema action
+    if (copySqlBtn) {
+      copySqlBtn.addEventListener('click', async () => {
+        const sql = `-- EduSpend PostgreSQL Schema
+CREATE TABLE IF NOT EXISTS public.profiles (
+  id UUID PRIMARY KEY REFERENCES auth.users(id) ON DELETE CASCADE,
+  email TEXT,
+  full_name TEXT,
+  currency TEXT NOT NULL DEFAULT '$',
+  monthly_allowance NUMERIC(12, 2) NOT NULL DEFAULT 500.00,
+  category_budgets JSONB NOT NULL DEFAULT '{"Food":140,"Academics":70,"Transport":45,"Housing":120,"Entertainment":40,"Personal":35,"Tech":25,"Other":25}'::jsonb,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS public.expenses (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id UUID NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
+  title TEXT NOT NULL,
+  amount NUMERIC(12, 2) NOT NULL CHECK (amount > 0),
+  category TEXT NOT NULL CHECK (category IN ('Food', 'Academics', 'Transport', 'Housing', 'Entertainment', 'Personal', 'Tech', 'Other')),
+  date DATE NOT NULL DEFAULT CURRENT_DATE,
+  payment_method TEXT NOT NULL DEFAULT 'UPI / Online',
+  notes TEXT DEFAULT '',
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+ALTER TABLE public.profiles ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.expenses ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY "Users can view own profile" ON public.profiles FOR SELECT USING (auth.uid() = id);
+CREATE POLICY "Users can update own profile" ON public.profiles FOR UPDATE USING (auth.uid() = id);
+CREATE POLICY "Users can insert own profile" ON public.profiles FOR INSERT WITH CHECK (auth.uid() = id);
+
+CREATE POLICY "Users can manage own expenses" ON public.expenses FOR ALL USING (auth.uid() = user_id);`;
+
+        try {
+          await navigator.clipboard.writeText(sql);
+          showToast('SQL Schema copied to clipboard!', 'success');
+        } catch (e) {
+          showToast('Check supabase/schema.sql in repo for the complete SQL!', 'info');
+        }
+      });
+    }
+
+    if (syncLocalBtn) {
+      syncLocalBtn.addEventListener('click', migrateLocalExpensesToCloud);
+    }
+
+    // Submit Auth Form
+    if (authForm) {
+      authForm.addEventListener('submit', async (e) => {
+        e.preventDefault();
+        clearAuthAlert();
+
+        if (!supabase) {
+          showAuthAlert('Supabase client is not loaded. Check network or configuration.');
+          return;
+        }
+
+        const email = document.getElementById('authEmail').value.trim();
+        const password = document.getElementById('authPassword').value;
+        const fullName = document.getElementById('authFullName')?.value.trim();
+        const submitBtn = document.getElementById('authSubmitBtn');
+        const originalText = document.getElementById('authSubmitText').textContent;
+
+        submitBtn.disabled = true;
+        submitBtn.classList.add('opacity-75');
+
+        try {
+          if (state.authTab === 'signin') {
+            const { data, error } = await supabase.auth.signInWithPassword({
+              email,
+              password
+            });
+            if (error) throw error;
+
+            closeAuthModal();
+            showToast('Signed in successfully!', 'success');
+          } else if (state.authTab === 'signup') {
+            if (!fullName) {
+              showAuthAlert('Please enter your full name.');
+              submitBtn.disabled = false;
+              submitBtn.classList.remove('opacity-75');
+              return;
+            }
+
+            const { data, error } = await supabase.auth.signUp({
+              email,
+              password,
+              options: {
+                data: {
+                  full_name: fullName
+                }
+              }
+            });
+            if (error) throw error;
+
+            if (data.session) {
+              closeAuthModal();
+              showToast(`Welcome to EduSpend, ${fullName}!`, 'success');
+            } else {
+              showAuthAlert('Account created! Please check your email to verify and sign in.', 'success');
+            }
+          } else if (state.authTab === 'reset') {
+            const { error } = await supabase.auth.resetPasswordForEmail(email);
+            if (error) throw error;
+            showAuthAlert('Password reset email sent! Check your inbox.', 'success');
+          }
+        } catch (err) {
+          showAuthAlert(err.message || 'Authentication failed. Please verify credentials.');
+        } finally {
+          submitBtn.disabled = false;
+          submitBtn.classList.remove('opacity-75');
+        }
+      });
+    }
+  }
+
+  // ==========================================
+  // EVENT LISTENERS & FORM SUBMISSIONS
+  // ==========================================
+
   function setupEventListeners() {
-    // Theme toggle buttons
     const themeBtn = document.getElementById('themeToggle');
     const themeBtnMobile = document.getElementById('themeToggleMobile');
     if (themeBtn) themeBtn.addEventListener('click', toggleTheme);
     if (themeBtnMobile) themeBtnMobile.addEventListener('click', toggleTheme);
 
-    // Mobile sidebar toggle
     const mobileMenuBtn = document.getElementById('mobileMenuBtn');
     const closeSidebarBtn = document.getElementById('closeSidebarBtn');
     const sidebarOverlay = document.getElementById('sidebarOverlay');
@@ -378,11 +1002,12 @@
     const currencySelect = document.getElementById('currencySelect');
     if (currencySelect) {
       currencySelect.value = state.currency;
-      currencySelect.addEventListener('change', (e) => {
+      currencySelect.addEventListener('change', async (e) => {
         state.currency = e.target.value;
-        saveState();
+        saveLocalState();
         renderAll();
         showToast(`Currency updated to ${state.currency}`, 'info');
+        await cloudUpdateProfile({ currency: state.currency });
       });
     }
 
@@ -394,9 +1019,9 @@
           state.expenses = [...DEFAULT_EXPENSES];
           state.monthlyAllowance = 500;
           setupCategoryBudgetDefaults();
-          saveState();
+          saveLocalState();
           renderAll();
-          showToast('Sample data restored successfully!', 'success');
+          showToast('Sample student data restored successfully!', 'success');
         }
       });
     }
@@ -422,7 +1047,7 @@
         if (amountInput) amountInput.value = amount;
         if (catRadio) catRadio.checked = true;
 
-        showToast(`Selected shortcut: ${title} (${state.currency}${amount})`, 'info');
+        showToast(`Selected preset: ${title} (${state.currency}${amount})`, 'info');
       });
     });
 
@@ -449,14 +1074,15 @@
     if (cancelModalBtn) cancelModalBtn.addEventListener('click', closeModal);
 
     if (confirmAllowanceBtn && modalAllowanceInput) {
-      confirmAllowanceBtn.addEventListener('click', () => {
+      confirmAllowanceBtn.addEventListener('click', async () => {
         const val = parseFloat(modalAllowanceInput.value);
         if (val && val > 0) {
           state.monthlyAllowance = val;
-          saveState();
+          saveLocalState();
           closeModal();
           renderAll();
           showToast(`Monthly allowance updated to ${state.currency}${val.toFixed(2)}`, 'success');
+          await cloudUpdateProfile({ monthly_allowance: val });
         } else {
           alert('Please enter a valid positive allowance amount.');
         }
@@ -467,13 +1093,14 @@
     const saveAllowanceBtn = document.getElementById('saveAllowanceBtn');
     const monthlyAllowanceInput = document.getElementById('monthlyAllowanceInput');
     if (saveAllowanceBtn && monthlyAllowanceInput) {
-      saveAllowanceBtn.addEventListener('click', () => {
+      saveAllowanceBtn.addEventListener('click', async () => {
         const val = parseFloat(monthlyAllowanceInput.value);
         if (val && val > 0) {
           state.monthlyAllowance = val;
-          saveState();
+          saveLocalState();
           renderAll();
           showToast(`Monthly allowance set to ${state.currency}${val.toFixed(2)}`, 'success');
+          await cloudUpdateProfile({ monthly_allowance: val });
         }
       });
     }
@@ -519,7 +1146,7 @@
   }
 
   // Handle Form Submission for Adding Expense
-  function handleAddExpenseSubmit(e) {
+  async function handleAddExpenseSubmit(e) {
     e.preventDefault();
 
     const amountInput = document.getElementById('expenseAmount');
@@ -551,9 +1178,9 @@
       notes
     };
 
-    // Add to state at beginning
+    // Optimistically add to state
     state.expenses.unshift(newExpense);
-    saveState();
+    saveLocalState();
 
     // Trigger confetti celebration
     if (window.confetti) {
@@ -575,21 +1202,33 @@
     // Update entire UI
     renderAll();
 
+    // Sync to Supabase in background
+    if (state.user) {
+      const synced = await cloudInsertExpense(newExpense);
+      if (synced) {
+        saveLocalState();
+      }
+    }
+
     // Switch back to dashboard to see results
     const dashBtn = document.querySelector('.nav-item[data-section="dashboard"]');
     if (dashBtn) dashBtn.click();
   }
 
   // Delete an expense
-  function deleteExpense(id) {
+  async function deleteExpense(id) {
     const item = state.expenses.find(e => e.id === id);
     if (!item) return;
 
     if (confirm(`Delete "${item.title}" (${state.currency}${item.amount.toFixed(2)})?`)) {
       state.expenses = state.expenses.filter(e => e.id !== id);
-      saveState();
+      saveLocalState();
       renderAll();
       showToast('Expense removed', 'info');
+
+      if (state.user) {
+        await cloudDeleteExpense(id);
+      }
     }
   }
 
@@ -628,7 +1267,6 @@
     const remainingBudget = monthlyAllowance - spentMonth;
     const pctUsed = monthlyAllowance > 0 ? (spentMonth / monthlyAllowance) * 100 : 0;
 
-    // Remaining days calculation
     const daysInMonth = new Date(currentYear, currentMonth + 1, 0).getDate();
     const currentDay = now.getDate();
     const daysRemaining = Math.max(1, daysInMonth - currentDay + 1);
@@ -658,7 +1296,6 @@
     renderBudgetPlanner();
   }
 
-  // Update Currency Prefixes in inputs and badges
   function renderCurrencySymbols() {
     const cur = state.currency;
 
@@ -672,7 +1309,6 @@
       if (el) el.textContent = cur;
     });
 
-    // Update preset labels
     document.querySelectorAll('.preset-amount-label').forEach(label => {
       const parent = label.closest('.quick-preset-btn');
       if (parent) {
@@ -681,7 +1317,6 @@
       }
     });
 
-    // Update current month badge
     const monthBadge = document.getElementById('currentMonthBadge');
     if (monthBadge) {
       const monthNames = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
@@ -689,7 +1324,6 @@
     }
   }
 
-  // Render Dashboard Top Metric Cards
   function renderDashboardMetrics() {
     const metrics = calculateMetrics();
     const cur = state.currency;
@@ -793,7 +1427,6 @@
     if (historyBadge) historyBadge.textContent = state.expenses.length;
   }
 
-  // Render Recent Transactions (Last 4)
   function renderRecentTransactions() {
     const listEl = document.getElementById('recentTransactionsList');
     if (!listEl) return;
@@ -842,7 +1475,6 @@
     }).join('');
   }
 
-  // Category Doughnut Chart (Chart.js)
   function updateCategoryChart() {
     const canvas = document.getElementById('categoryChart');
     if (!canvas) return;
@@ -855,7 +1487,6 @@
     const dataValues = labels.map(l => metrics.categoryTotals[l] || 0);
     const backgroundColors = labels.map(l => isDark ? CATEGORIES[l].darkColor : CATEGORIES[l].color);
 
-    // Find top category
     let topCat = 'None';
     let topAmount = 0;
     labels.forEach(l => {
@@ -871,7 +1502,6 @@
     if (topCategoryNameEl) topCategoryNameEl.textContent = topCat;
     if (topCategoryAmountEl) topCategoryAmountEl.textContent = `${cur}${topAmount.toFixed(2)}`;
 
-    // Build custom mini legend list
     const legendEl = document.getElementById('categoryLegendList');
     if (legendEl) {
       const activeCats = labels
@@ -905,7 +1535,7 @@
         datasets: [{
           data: dataValues,
           backgroundColor: backgroundColors,
-          borderWidth: isDark ? 2 : 2,
+          borderWidth: 2,
           borderColor: isDark ? '#0f172a' : '#ffffff',
           hoverOffset: 6
         }]
@@ -915,9 +1545,7 @@
         maintainAspectRatio: false,
         cutout: '72%',
         plugins: {
-          legend: {
-            display: false
-          },
+          legend: { display: false },
           tooltip: {
             backgroundColor: isDark ? '#1e293b' : '#ffffff',
             titleColor: isDark ? '#f8fafc' : '#0f172a',
@@ -925,7 +1553,6 @@
             borderColor: isDark ? '#334155' : '#e2e8f0',
             borderWidth: 1,
             padding: 10,
-            boxPadding: 4,
             callbacks: {
               label: function (ctx) {
                 const label = ctx.label || '';
@@ -939,7 +1566,6 @@
     });
   }
 
-  // Daily Spending Chart (Area / Smooth Line)
   function updateDailyChart() {
     const canvas = document.getElementById('dailySpendingChart');
     if (!canvas) return;
@@ -947,11 +1573,6 @@
     const cur = state.currency;
     const isDark = document.documentElement.classList.contains('dark');
 
-    // Aggregate daily totals
-    const daysInMonth = new Date(currentYear, currentMonth + 1, 0).getDate();
-    let numDaysToShow = state.chartRange === '7days' ? 7 : Math.min(now.getDate(), daysInMonth);
-    
-    // Create day buckets
     const labels = [];
     const spendPerDay = [];
     let sumTotal = 0;
@@ -971,7 +1592,6 @@
         sumTotal += totalOnDay;
       }
     } else {
-      // Current month up to today
       const maxDay = now.getDate();
       for (let day = 1; day <= maxDay; day++) {
         const d = new Date(currentYear, currentMonth, day);
@@ -1042,9 +1662,7 @@
           mode: 'index',
         },
         plugins: {
-          legend: {
-            display: false
-          },
+          legend: { display: false },
           tooltip: {
             backgroundColor: isDark ? '#1e293b' : '#ffffff',
             titleColor: isDark ? '#f8fafc' : '#0f172a',
@@ -1095,7 +1713,6 @@
     });
   }
 
-  // Render Expense History Table
   function renderHistoryTable() {
     const tableBody = document.getElementById('historyTableBody');
     const emptyState = document.getElementById('historyEmptyState');
@@ -1118,7 +1735,6 @@
       return matchesSearch && matchesCat;
     });
 
-    // Sort
     filtered.sort((a, b) => {
       if (sortVal === 'date-desc') return new Date(b.date) - new Date(a.date);
       if (sortVal === 'date-asc') return new Date(a.date) - new Date(b.date);
@@ -1127,7 +1743,7 @@
       return 0;
     });
 
-    const totalSum = filtered.reduce((acc, cur) => acc + cur.amount, 0);
+    const totalSum = filtered.reduce((acc, c) => acc + c.amount, 0);
 
     if (countEl) countEl.textContent = `Showing ${filtered.length} transaction${filtered.length === 1 ? '' : 's'}`;
     if (sumEl) sumEl.textContent = `Total: ${cur}${totalSum.toFixed(2)}`;
@@ -1180,9 +1796,8 @@
       `;
     }).join('');
 
-    // Attach delete listeners
     document.querySelectorAll('.delete-expense-btn').forEach(btn => {
-      btn.addEventListener('click', (e) => {
+      btn.addEventListener('click', () => {
         const id = btn.dataset.id;
         if (id) deleteExpense(id);
       });
@@ -1193,7 +1808,6 @@
     }
   }
 
-  // Render Budget Planner Section
   function renderBudgetPlanner() {
     const allowanceInput = document.getElementById('monthlyAllowanceInput');
     if (allowanceInput) allowanceInput.value = state.monthlyAllowance;
@@ -1202,7 +1816,6 @@
     const allowance = state.monthlyAllowance;
     const metrics = calculateMetrics();
 
-    // 50/30/20 student breakdown
     const needs = allowance * 0.50;
     const wants = allowance * 0.30;
     const savings = allowance * 0.20;
@@ -1214,7 +1827,6 @@
     if (wantsEl) wantsEl.textContent = `${cur}${wants.toFixed(2)}`;
     if (savingsEl) savingsEl.textContent = `${cur}${savings.toFixed(2)}`;
 
-    // Savings Milestone
     const milestonePaceEl = document.getElementById('milestoneTargetPace');
     const projectedSavingsEl = document.getElementById('projectedSavingsAmount');
     if (milestonePaceEl) milestonePaceEl.textContent = `${cur}${metrics.safeDailyPace.toFixed(2)}/day`;
@@ -1223,7 +1835,6 @@
       projectedSavingsEl.textContent = `${cur}${projected.toFixed(2)}`;
     }
 
-    // Render Category Budget Cards
     const cardsContainer = document.getElementById('categoryBudgetCards');
     if (!cardsContainer) return;
 
@@ -1274,7 +1885,6 @@
     }).join('');
   }
 
-  // Export Expenses to CSV
   function exportExpensesToCSV() {
     if (state.expenses.length === 0) {
       showToast('No expenses available to export!', 'error');
@@ -1303,7 +1913,6 @@
     showToast('Exported expenses to CSV!', 'success');
   }
 
-  // Toast Notification System
   function showToast(message, type = 'info') {
     const container = document.getElementById('toastContainer');
     if (!container) return;
@@ -1336,7 +1945,6 @@
     }, 3200);
   }
 
-  // XSS prevention escape helper
   function escapeHtml(str) {
     if (!str) return '';
     return str
